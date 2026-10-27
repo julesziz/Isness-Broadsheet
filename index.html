@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Isness — Broadsheet</title>
+<style>
+  /*
+    Broadsheet reader.
+    Pages: pNN.jpg (next to this file) — p02 front cover, p01 back cover, p03–p40 inside.
+    Starts folded "above the fold" (top half of the front cover), unfolds,
+    then turns like a stack of loose leaves: cover → spreads 03|04 … 39|40 → back cover.
+    Each turning leaf is split into vertical strips so it can bend like newsprint;
+    the slider fans several leaves at once to flip through quickly.
+  */
+  :root {
+    --bg: #ffffff;
+    --paper: #ebe7dc;
+    --ink: #8c877c;
+    --w: 300px;                  /* one page width; set by JS */
+    --h: calc(var(--w) / .7);    /* pages are 1323 × 1890 */
+    --dur: 1150ms;
+    --ease: cubic-bezier(.45, .05, .25, 1);
+    --drop: 0 1px 2px rgba(40, 30, 10, .05), 0 8px 18px -8px rgba(40, 30, 10, .16);
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+
+  .stage {
+    position: relative; width: 100%; height: 100%;
+    perspective: 3200px;
+    user-select: none; -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: pan-y;
+  }
+
+  /* the book is a full open spread (2w × h); JS moves/scales it to frame each state */
+  .book {
+    position: absolute; left: 50%; top: 50%;
+    width: calc(var(--w) * 2); height: var(--h);
+    margin-left: calc(var(--w) * -1); margin-top: calc(var(--h) / -2);
+    transform-style: preserve-3d;
+    transition: transform var(--dur) var(--ease);
+  }
+
+  /* ---------- paper surfaces ---------- */
+  .sheet, .face {
+    background-color: var(--paper);
+    background-size: var(--w) var(--h);
+    background-repeat: no-repeat;
+  }
+  .sheet { position: absolute; top: 0; width: var(--w); height: var(--h); }
+  .page.left  { left: 0; width: calc(var(--w) + 1px); } /* tucks 1px under the right page */
+  /* gutter-colored backing so a sub-pixel seam never shows white */
+  .spine { position: absolute; top: 0; left: calc(var(--w) - 3px); width: 6px; height: var(--h); background: #cfc9bb; }
+  .page.right { left: var(--w); }
+  .hidden { visibility: hidden; }
+
+  /* overlay layers on every surface. They're sized to a full page and positioned
+     like the page image, so the shading lines up across the turning strips. */
+  .shade, .fx, .hl, .grain {
+    position: absolute; inset: 0; pointer-events: none;
+    background-size: var(--w) var(--h);
+    background-repeat: no-repeat;
+  }
+  .shade { background: #1a1408; opacity: 0; }
+
+  /* shadows: the horizontal fold, the spine gutter, and a faint unevenness toward the corners */
+  .fx {
+    mix-blend-mode: multiply;
+    background-image:
+      linear-gradient(to bottom,
+        transparent 44%, rgba(80,62,30,.018) 47%, rgba(80,62,30,.05) 49.3%,
+        rgba(60,45,20,.12) 49.9%, rgba(60,45,20,.07) 50.25%,
+        rgba(80,62,30,.035) 51.2%, rgba(80,62,30,.014) 53.5%, transparent 57%),
+      linear-gradient(var(--gut),
+        rgba(55,40,15,.26) 0%, rgba(55,40,15,.15) .8%, rgba(60,45,20,.085) 2.2%,
+        rgba(70,55,25,.045) 4.5%, rgba(70,55,25,.02) 8%, rgba(70,55,25,.007) 13%, transparent 20%),
+      radial-gradient(ellipse 120% 90% at 50% 50%, transparent 60%, rgba(80,62,30,.05) 100%);
+  }
+  /* highlights where the paper bends toward the light, just beside each crease */
+  .hl {
+    mix-blend-mode: screen;
+    background-image:
+      linear-gradient(to bottom,
+        transparent 45.5%, rgba(255,252,240,.05) 48.2%, rgba(255,252,240,.11) 49.45%, transparent 49.8%),
+      linear-gradient(var(--gut),
+        transparent 3%, rgba(255,252,240,.05) 6%, rgba(255,252,240,.09) 9%, rgba(255,252,240,.04) 13%, transparent 18%);
+  }
+  .grain {
+    mix-blend-mode: multiply;
+    opacity: .14;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .45  0 0 0 0 .4  0 0 0 0 .3  0 0 0 1.3 -.25'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 240px 240px;
+    background-repeat: repeat;
+  }
+  /* right-hand pages have the spine on their left; left-hand pages on their right */
+  .rp { --gut: to right; }
+  .lp { --gut: to left; }
+
+  /* ---------- the turning leaves (each built from strips) ---------- */
+  #leaves { position: absolute; inset: 0; transform-style: preserve-3d; pointer-events: none; }
+  .leaf {
+    position: absolute; left: var(--w); top: 0;
+    width: var(--w); height: var(--h);
+    transform-style: preserve-3d;
+    pointer-events: none;
+  }
+  .strip {
+    position: absolute; top: 0; left: 0; height: var(--h);
+    transform-style: preserve-3d;
+    transform-origin: 0 50%;
+  }
+  .face {
+    position: absolute; inset: 0; right: -1px; /* 1px overlap hides seams */
+    backface-visibility: hidden; -webkit-backface-visibility: hidden;
+    overflow: hidden;
+  }
+  .face.b { transform: rotateY(180deg); }
+
+  /* ---------- folded front cover (above the fold) ---------- */
+  .fold { position: absolute; left: var(--w); top: 0; width: var(--w); height: var(--h); transform-style: preserve-3d; }
+  .fold .top, .fold .bot { position: absolute; left: 0; width: var(--w); height: calc(var(--h) / 2); }
+  .fold .top { top: 0; box-shadow: var(--drop); }
+  .fold .top .sheet { width: 100%; height: 100%; }
+  .fold .bot {
+    top: calc(var(--h) / 2);
+    transform-origin: 50% 0;
+    transform-style: preserve-3d;
+    transition: transform var(--dur) var(--ease);
+  }
+  .fold .bot > .face { right: 0; }
+  .fold .bot > .face.b { transform: rotateX(180deg); }
+  .folded .fold .bot { transform: rotateX(-179.5deg); }
+  .fold .bot .shade { transition: opacity var(--dur) var(--ease); }
+  .folded .fold .bot .shade { opacity: .25; }
+
+  /* ---------- counter ---------- */
+  .counter {
+    position: absolute; left: 0; right: 0; bottom: 14px;
+    text-align: center; pointer-events: none;
+    font: 11px/1 "Helvetica Neue", Helvetica, Arial, sans-serif;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--ink);
+  }
+
+  /* ---------- scrub slider ---------- */
+  .scrub {
+    position: absolute; left: 50%; bottom: 34px; transform: translateX(-50%);
+    width: min(320px, 70vw); margin: 0;
+    -webkit-appearance: none; appearance: none; background: none; cursor: pointer;
+    transition: opacity .4s;
+  }
+  .scrub.off { opacity: 0; pointer-events: none; }
+  .scrub::-webkit-slider-runnable-track { height: 1px; background: #cfc9bb; }
+  .scrub::-moz-range-track { height: 1px; background: #cfc9bb; }
+  .scrub::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 11px; height: 11px; margin-top: -5px;
+    border-radius: 50%; background: var(--ink); border: 0;
+  }
+  .scrub::-moz-range-thumb { width: 11px; height: 11px; border-radius: 50%; background: var(--ink); border: 0; }
+  .scrub:focus { outline: none; }
+
+  @media (prefers-reduced-motion: reduce) { :root { --dur: 1ms; } }
+</style>
+</head>
+<body>
+<div class="stage" id="stage" role="application" aria-label="Isness broadsheet — click or use arrow keys to turn pages" tabindex="0">
+  <div class="book" id="book">
+    <div class="spine hidden" id="spine"></div>
+    <div class="sheet page left lp hidden" id="L"></div>
+    <div class="sheet page right rp hidden" id="R"></div>
+    <div id="leaves"></div>
+    <div class="fold rp" id="fold">
+      <div class="top"><div class="sheet" id="foldTop"></div></div>
+      <div class="bot">
+        <div class="face f" id="foldBot"></div>
+        <div class="face b" id="foldBack"></div>
+      </div>
+    </div>
+  </div>
+  <input class="scrub off" id="scrub" type="range" min="0" max="20" step="1" value="0" aria-label="Flip through pages">
+  <div class="counter" id="counter"></div>
+</div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const stage = $('stage'), book = $('book'), L = $('L'), R = $('R'), scrub = $('scrub');
+  const src = n => `p${String(n).padStart(2, '0')}.jpg`;
+  const OVERLAYS = '<div class="shade"></div><div class="fx"></div><div class="hl"></div><div class="grain"></div>';
+
+  // view 0 = front cover alone, 1–19 = spreads (2v+1 | 2v+2), 20 = back cover alone
+  const LAST = 20;
+  const leftOf  = v => v === 0 ? null : v === LAST ? 1 : 2 * v + 1;
+  const rightOf = v => v === 0 ? 2    : v === LAST ? null : 2 * v + 2;
+
+  let view = 0, folded = true, sideways = true, busy = false;
+
+  [L, R, $('foldTop'), $('foldBot')].forEach(el => el.innerHTML = OVERLAYS);
+  $('foldBack').innerHTML = '<div class="grain"></div>';
+
+  // ---------- turning leaves: each is a chain of strips so it can bend ----------
+  // a pool, so several can be in the air at once when fanning through with the slider
+  const N = 12, POOL = 8;
+  const leaves = Array.from({ length: POOL }, () => {
+    const el = document.createElement('div');
+    el.className = 'leaf hidden';
+    const strips = [];
+    let parent = el;
+    for (let i = 0; i < N; i++) {
+      const s = document.createElement('div');
+      s.className = 'strip';
+      s.innerHTML = `<div class="face f rp">${OVERLAYS}</div><div class="face b lp">${OVERLAYS}</div>`;
+      parent.appendChild(s);
+      strips.push(s);
+      parent = s;
+    }
+    $('leaves').appendChild(el);
+    return { el, strips };
+  });
+
+  // point a surface and all its overlay layers at the same part of the page
+  function place(el, pos) {
+    el.style.backgroundPosition = pos;
+    for (const c of el.children) if (!c.classList.contains('grain')) c.style.backgroundPosition = pos;
+  }
+
+  // ---------- sizing ----------
+  let W = 300, H = 300 / .7;
+  function layout() {
+    const vw = stage.clientWidth, vh = stage.clientHeight - 70;
+    W = Math.floor(Math.min(vw * .92 / 2, vh * .93 * .7));
+    H = W / .7;
+    document.documentElement.style.setProperty('--w', W + 'px');
+    const sw = W / N;
+    leaves.forEach(({ strips }) => strips.forEach((s, i) => {
+      s.style.width = sw + 'px';
+      if (i) s.style.left = sw + 'px';
+      place(s.children[0], `${-i * sw}px 0`);
+      place(s.children[1], `${-(W - (i + 1) * sw)}px 0`);
+      // the 1px seam overlap would land on the spine for the first back face and show bare paper
+      if (i === 0) s.children[1].style.right = '0';
+    }));
+    place($('foldTop'), '0 0');
+    place($('foldBot'), '0 100%');
+    setEdges();
+    frame(false);
+  }
+
+  // frame the visible part: folded top half, a single cover, or the spread
+  // sideways: the cover is turned 90° left so ISNESS reads across, folded or open
+  function frame(animate = true, ms) {
+    const vw = stage.clientWidth, vh = stage.clientHeight - 70;
+    let rw = 2 * W, rh = H, dx = 0, dy = 0, cap = 1, rot = 0;
+    if (sideways && folded) { rw = H / 2; rh = W; dx = -W / 2; dy = H / 4; cap = 1.25; rot = -90; }
+    else if (sideways)      { rw = H; rh = W; dx = -W / 2; cap = 1.15; rot = -90; }
+    else if (folded)        { rw = W; rh = H / 2; dx = -W / 2; dy = H / 4; cap = 1.35; }
+    else if (view === 0)    { rw = W; dx = -W / 2; cap = 1.15; }
+    else if (view === LAST) { rw = W; dx =  W / 2; cap = 1.15; }
+    const s = Math.min(vw * .94 / rw, vh * .94 / rh, cap);
+    book.style.transition = animate ? '' : 'none';
+    book.style.transitionDuration = ms ? ms + 'ms' : '';
+    book.style.transform = `scale(${s}) rotate(${rot}deg) translate(${dx}px, ${dy}px)`;
+  }
+
+  // loose-leaf edges: thin offset sheets peeking out on each side, as many as are stacked there
+  function edgeStack(count, dir) {
+    const n = Math.min(7, Math.ceil(count / 2.5));
+    const layers = [];
+    for (let k = 1; k <= n; k++) {
+      const c = k % 2 ? '#ddd8cb' : '#e8e4d9';
+      layers.push(`${dir * k * .7}px ${k * .35}px 0 0 ${c}`);
+    }
+    return layers.concat('var(--drop)').join(', ');
+  }
+  function setEdges() {
+    L.style.boxShadow = edgeStack(view, -1);
+    R.style.boxShadow = edgeStack(LAST - view, 1);
+    R.style.clipPath = view === 0 ? 'none' : 'inset(-60px -60px -60px 0)';
+  }
+
+  function setPage(el, n) {
+    el.classList.toggle('hidden', n == null);
+    if (n != null) el.style.backgroundImage = `url(${src(n)})`;
+  }
+  function setPages() {
+    setPage(L, leftOf(view));
+    setPage(R, folded ? null : rightOf(view));
+    $('spine').classList.toggle('hidden', folded || view === 0 || view === LAST);
+    setEdges();
+  }
+  function showView() {
+    scrub.value = view;
+    scrub.classList.toggle('off', folded);
+    $('counter').textContent =
+      folded ? 'Isness — click to open' :
+      view === 0 ? 'Front cover' :
+      view === LAST ? 'Back cover' :
+      `${String(2 * view).padStart(2, '0')}–${String(2 * view + 1).padStart(2, '0')}`;
+  }
+
+  // ---------- fold / unfold the front cover ----------
+  $('foldTop').style.backgroundImage = `url(${src(2)})`;
+  $('foldBot').style.backgroundImage = `url(${src(2)})`;
+  const TURN90 = 700;
+  function setFolded(f) {
+    busy = true;
+    $('fold').classList.remove('hidden');
+    R.classList.add('hidden');
+    const unfold = () => {
+      folded = f;
+      stage.classList.toggle('folded', f);
+      frame();
+      showView();
+    };
+    if (!f) {
+      // unfold sideways (ISNESS reads across), then turn 90° right to stand upright
+      unfold();
+      setTimeout(() => { sideways = false; frame(true, TURN90); }, dur());
+      setTimeout(() => { $('fold').classList.add('hidden'); setPages(); busy = false; }, dur() + TURN90);
+    } else {
+      // turn back on its side, then fold closed
+      sideways = true; frame(true, TURN90);
+      setTimeout(unfold, TURN90);
+      setTimeout(() => busy = false, TURN90 + dur());
+    }
+  }
+
+  // ---------- turning ----------
+  const dur = () => parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--dur')) || 1150;
+  const ease = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+  // animate one leaf from one view to the next; `j`/`m` give its place in a fan
+  function flyLeaf(lf, lo, hi, dir, D, delay, j, m, onLand, cast) {
+    const front = rightOf(lo), back = leftOf(hi);
+    lf.strips.forEach(st => {
+      st.children[0].style.backgroundImage = `url(${src(front)})`;
+      st.children[1].style.backgroundImage = `url(${src(back)})`;
+    });
+    const a0 = dir > 0 ? 0 : -180, a1 = dir > 0 ? -180 : 0;
+    const lShade = L.querySelector('.shade'), rShade = R.querySelector('.shade');
+    const pose = e => {
+      const angle = a0 + (a1 - a0) * e;
+      // leafy bend: the free edge leads as it lifts, trails as it falls,
+      // and bends more toward the edge than near the spine
+      const flutter = .55 * Math.sin(2 * Math.PI * e) + .45 * Math.sin(Math.PI * e);
+      const bend = (dir > 0 ? -1 : 1) * 16 * flutter;
+      // stacking: leaves still on their starting side keep their stack order; once over, the newest lands on top
+      const z = 1 + .4 * (e < .5 ? m - j : j);
+      let world = angle;
+      lf.strips.forEach((st, i) => {
+        const a = i === 0 ? angle : bend * Math.pow(i / (N - 1), 1.3);
+        if (i) world += a;
+        st.style.transform = i === 0 ? `translateZ(${z}px) rotateY(${a}deg)` : `rotateY(${a}deg)`;
+        // light falls off as each strip tilts away from the viewer
+        const lit = Math.abs(Math.cos(world * Math.PI / 180));
+        st.children[0].firstChild.style.opacity = st.children[1].firstChild.style.opacity = (1 - lit) * .3;
+      });
+      if (cast) {
+        // the page being uncovered sits in the leaf's shadow
+        const c = Math.sin(Math.PI * e) * .14;
+        (dir > 0 ? rShade : lShade).style.opacity = c * (1 - e);
+        (dir > 0 ? lShade : rShade).style.opacity = c * e;
+      }
+    };
+    pose(0);
+    lf.el.classList.remove('hidden');
+    return new Promise(done => {
+      const t0 = performance.now() + delay;
+      function step(now) {
+        const t = Math.max(0, Math.min(1, (now - t0) / D));
+        pose(ease(t));
+        if (t < 1) return requestAnimationFrame(step);
+        if (cast) lShade.style.opacity = rShade.style.opacity = 0;
+        lf.el.classList.add('hidden');
+        onLand();
+        done();
+      }
+      requestAnimationFrame(step);
+    });
+  }
+
+  // go from the current view to `target`: one leaf for a single turn,
+  // a fan of up to 8 quick leaves for a jump
+  let pending = null;
+  async function go(target, fast) {
+    target = Math.max(0, Math.min(LAST, target));
+    if (busy) { pending = target; return; }
+    if (target === view) return;
+    busy = true;
+
+    const from = view, dir = Math.sign(target - from);
+    const steps = Math.abs(target - from), m = Math.min(steps, POOL);
+    const vs = Array.from({ length: m + 1 }, (_, j) => from + dir * Math.round(j * steps / m));
+    const D = fast || m > 1 ? 560 : dur(), STAGGER = 75;
+
+    // underneath: the destination page on the far side, the starting page on the near side
+    if (dir > 0) { setPage(R, rightOf(target)); setPage(L, leftOf(from)); }
+    else         { setPage(L, leftOf(target));  setPage(R, rightOf(from)); }
+    $('spine').classList.remove('hidden');
+
+    view = target;
+    frame(true, D + (m - 1) * STAGGER);
+    showView();
+
+    await Promise.all(vs.slice(0, -1).map((v, j) => {
+      const next = vs[j + 1];
+      return flyLeaf(leaves[j], Math.min(v, next), Math.max(v, next), dir, D, j * STAGGER, j, m,
+        () => dir > 0 ? setPage(L, leftOf(next)) : setPage(R, rightOf(next)), m === 1);
+    }));
+
+    setPages();
+    busy = false;
+    if (pending != null) { const p = pending; pending = null; go(p, true); }
+  }
+
+  function turn(dir) {
+    if (busy) return;
+    if (folded) { if (dir > 0) setFolded(false); return; }
+    if (dir < 0 && view === 0) { setFolded(true); return; }
+    go(view + dir);
+  }
+
+  // slider: drag to fan through the pages
+  ['click', 'pointerdown', 'pointerup'].forEach(t => scrub.addEventListener(t, e => e.stopPropagation()));
+  scrub.addEventListener('input', () => go(+scrub.value, true));
+
+  // ---------- input ----------
+  let sx = null, swiped = false;
+  stage.addEventListener('click', e => {
+    if (swiped) return;
+    const r = stage.getBoundingClientRect();
+    turn(e.clientX - r.left < r.width / 2 && !folded ? -1 : 1);
+  });
+  addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); turn(1); }
+    if (e.key === 'ArrowLeft') turn(-1);
+  });
+  stage.addEventListener('pointerdown', e => { sx = e.clientX; swiped = false; });
+  stage.addEventListener('pointerup', e => {
+    if (sx == null) return;
+    const dx = e.clientX - sx; sx = null;
+    if (Math.abs(dx) > 40) { swiped = true; turn(dx < 0 ? 1 : -1); setTimeout(() => swiped = false, 0); }
+  });
+  stage.addEventListener('mousemove', e => {
+    const r = stage.getBoundingClientRect();
+    stage.style.cursor = folded ? 's-resize' : (e.clientX - r.left < r.width / 2 ? 'w-resize' : 'e-resize');
+  });
+
+  addEventListener('resize', layout);
+  stage.classList.add('folded');
+  layout();
+  setPages();
+  showView();
+
+  // ?view=N opens straight to a view (for testing / deep links)
+  const q = new URLSearchParams(location.search).get('view');
+  if (q != null) {
+    folded = false; sideways = false; stage.classList.remove('folded');
+    view = Math.max(0, Math.min(LAST, +q));
+    $('fold').classList.add('hidden'); setPages(); showView(); frame(false);
+  }
+
+  // preload pages in reading order
+  [2, 3, 4, 5, 6, 1].concat(Array.from({ length: 34 }, (_, i) => i + 7))
+    .forEach(n => { const im = new Image(); im.src = src(n); });
+</script>
+</body>
+</html>
